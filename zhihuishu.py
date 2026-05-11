@@ -9,7 +9,7 @@ async def human_delay(min_s=0.3, max_s=1.2):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
-COURSE_URL = "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=4e59515b40584859454a585958435b4750"
+COURSE_URL = "这里填入课程的链接"
 STATE_FILE = "zhihuishu_state.json"
 PROGRESS_FILE = "zhihuishu_progress.json"
 

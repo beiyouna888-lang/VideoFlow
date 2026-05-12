@@ -9,7 +9,7 @@ async def human_delay(min_s=0.3, max_s=1.2):
     await asyncio.sleep(random.uniform(min_s, max_s))
 
 
-COURSE_URL = "这里填入课程的链接"
+COURSE_URL = "https://studyvideoh5.zhihuishu.com/stuStudy?recruitAndCourseId=4e59515b40584859454a585958435b4750"
 STATE_FILE = "zhihuishu_state.json"
 PROGRESS_FILE = "zhihuishu_progress.json"
 
@@ -69,196 +69,504 @@ async def click_btn(ctx, texts):
     return None
 
 
-async def ensure_playing(page):
-    """确保视频正在播放，并锁1.5倍速"""
+async def ensure_playing(page,rate=1.4):
+    """确保视频正在播放并锁1.4倍速"""
     v = await page.query_selector("video")
     if not v:
         return False
     try:
         try:
-            await v.evaluate("v => { v.playbackRate = 1.4; v.muted = true; }")
+            await v.evaluate("(v, rate) => v.playbackRate = rate", rate)
         except:
             pass
 
         paused = await v.evaluate("v => v.paused")
         if not paused:
             return True  # 已经在播放
-
+        
         print("   ▶️ 尝试播放并提速...")
 
         try:
-            await v.evaluate("v => v.play()")
-            await asyncio.sleep(1)
-            if not await v.evaluate("v => v.paused"):
-                print("   ✅ 播放成功 (已锁定 1.5 倍速 + 静音)")
+            # 尝试JS播放
+            ok = await v.evaluate(
+                """async (v, rate) => {
+                    try {
+                        v.muted = true;
+                        v.playbackRate = rate;
+                        await v.play();
+                        return !v.paused;
+                    } catch (e) {
+                        return false;
+                    }
+                }""",
+                rate
+            )
+
+            if ok:
+                print(f"   ✅ 播放成功，已设置 {rate} 倍速 + 静音")
                 return True
+
+            # 尝试点击播放器中心
+            player = await page.query_selector(".able-player-container")
+            if player:
+                box = await player.bounding_box()
+                if box:
+                    x = box["x"] + box["width"] / 2
+                    y = box["y"] + box["height"] / 2
+                    await page.mouse.click(x, y)
+                    print(f"   ✅ 点击播放器 ({x:.0f}, {y:.0f})")
+                    await asyncio.sleep(1)
+
+                    await v.evaluate("(v, rate) => v.playbackRate = rate", rate)
+
+                    if not await v.evaluate("v => v.paused"):
+                        return True
         except:
             pass
-
-        player = await page.query_selector('.able-player-container')
-        if player:
-            box = await player.bounding_box()
-            if box:
-                # 点正中间
-                x = box['x'] + box['width'] / 2
-                y = box['y'] + box['height'] / 2
-                await page.mouse.click(x, y)
-                print(f"   ✅ 点击播放器 ({x:.0f}, {y:.0f})")
-                await asyncio.sleep(2)
-                if not await v.evaluate("v => v.paused"):
-                    return True
-
-        for sel in ['.bigPlayButton', '.vjs-big-play-button', '.playButton']:
-            btn = await page.query_selector(sel)
-            if btn:
-                try:
-                    await btn.evaluate("el => el.click()")
-                    await asyncio.sleep(1)
-                    if not await v.evaluate("v => v.paused"):
-                        print(f"   ✅ 点击 {sel} 成功")
-                        return True
-                except:
-                    continue
 
         return False
     except Exception as e:
         print(f"   ⚠️ ensure_playing 报错: {e}")
         return False
 
-
 async def handle_question(page):
+    """先检测弹窗，再判断是否题目：是题目就随便选一个答案，不是题目就关闭"""
+
+    # ========== 0. 先清理一些常见非题目弹窗 ==========
+    try:
+        await page.evaluate("""() => {
+            let btns = document.querySelectorAll('button, .el-button, .el-dialog__headerbtn');
+            btns.forEach(btn => {
+                let txt = btn.innerText || "";
+                if (
+                    txt.includes("下次再说") ||
+                    txt.includes("已绑定") ||
+                    txt.includes("不再提示") ||
+                    txt.includes("我知道了")
+                ) {
+                    btn.click();
+                }
+            });
+        }""")
+    except:
+        pass
+
+    # ========== 1. 遍历主页面 + iframe ==========
     for ctx in [page] + page.frames:
         try:
-            # 抓取弹窗元素
-            d = await find_el(ctx, [
-                '[class*="dialog"]', '[class*="modal"]', '.el-dialog', '.el-overlay',
-                '[class*="question"]', '[class*="popup"]', '[class*="mask"]'
-            ])
-            if not d: continue
-            t = (await d.inner_text() or "").strip()
-            if len(t) < 10: continue
+            # 先找有没有弹窗，不管是不是题目
+            d = await find_real_popup(ctx)
+            if not d:
+                continue
 
-           # ========== 1. 专门对付 AI 小智 ==========
-            if "AI助教小智" in t or "不会影响" in t or "小智给你出题啦" in t:
-                print(f"\n🤖 发现 [AI助教小智] 弹窗！...")
-                
-                clicked = False
-                # 策略：直接找屏幕上的文字，获取绝对物理坐标，用虚拟鼠标去点屏幕像素！
-                for target_text in ["A. 对", "A.", "对", "A", "正确"]:
+            print("\n⚠️ 检测到弹窗")
+
+            # 获取弹窗文字
+            popup_text = ""
+            try:
+                if d:
+                    popup_text = (await d.inner_text() or "").strip()
+                else:
+                    popup_text = await ctx.evaluate("() => document.body.innerText || ''")
+            except:
+                popup_text = ""
+
+            # ========== 2. 判断这个弹窗是不是题目 ==========
+            question_keywords = [
+                "单选题",
+                "多选题",
+                "判断题",
+                "题目",
+                "未做答的弹题不能关闭"
+            ]
+
+            is_question = any(kw in popup_text for kw in question_keywords)
+
+            # 再用选项结构辅助判断
+            option_count = 0
+            try:
+                root = d if d else ctx
+                options = await root.query_selector_all(
+                    'label.el-radio, label.el-checkbox, .el-radio, .el-checkbox, '
+                    '.topic-item, .answerItem'
+                )
+
+                for opt in options:
                     try:
-                        # 模糊查找包含这些文字的元素
-                        els = await d.query_selector_all(f'text="{target_text}"')
-                        for el in els:
-                            box = await el.bounding_box()
-                            # 确保该文字在屏幕上是可见的（有长宽）
-                            if box and box['width'] > 0 and box['height'] > 0:
-                                # 计算文字的正中心坐标
-                                center_x = box['x'] + box['width'] / 2
-                                center_y = box['y'] + box['height'] / 2
-                                
-                                # 将鼠标平滑移动过去（纯物理操作，100% 模拟真人）
-                                await page.mouse.move(center_x, center_y)
-                                await asyncio.sleep(0.2)
-                                # 狙击文字中心
-                                await page.mouse.click(center_x, center_y)
-                                
-                                # 保险起见：往文字左边偏移 15 像素（通常是圆圈所在的位置）再点一次
-                                await page.mouse.click(box['x'] - 15, center_y)
-                                
-                                print(f"   🎯 : '{target_text}'")
-                                clicked = True
-                                break
-                    except Exception as e:
+                        if await opt.is_visible():
+                            txt = (await opt.text_content() or "").strip()
+                            if txt and len(txt) < 300:
+                                option_count += 1
+                    except:
                         continue
-                    
-                    if clicked: break
 
-                print(" ⏳ 等待 2 秒让系统出答案...")
-                await asyncio.sleep(2)
-                
-                print(" 🚪 正在关闭弹窗...")
-                # 同样用屏幕坐标法关闭弹窗，无视任何弹窗遮罩层
+                if option_count >= 2:
+                    is_question = True
+            except:
+                pass
+
+            # ========== 3. 如果是题目：随便选一个答案 ==========
+            if is_question:
+                print("   📌 判断为题目弹窗，准备随便选择一个答案")
+
+                await close_unanswered_warning(page, ctx)
+
+                clicked = False
+                root = d if d else ctx
+
+                # 3.1 优先找选项按钮/选项行
                 try:
-                    close_btns = await d.query_selector_all('text="关闭"')
-                    for btn in close_btns:
-                        box = await btn.bounding_box()
-                        if box and box['width'] > 0:
-                            cx = box['x'] + box['width'] / 2
-                            cy = box['y'] + box['height'] / 2
-                            await page.mouse.click(cx, cy)
-                            print("   ✅ 已通过坐标点击屏幕上的[关闭]按钮")
+                    option_selectors = [
+                        'label.el-radio',
+                        'label.el-checkbox',
+                        '.el-radio',
+                        '.el-checkbox',
+                        '.topic-item',
+                        '.answerItem',
+                        '[class*="option"]',
+                        'li'
+                    ]
+
+                    all_options = []
+
+                    for sel in option_selectors:
+                        try:
+                            els = await root.query_selector_all(sel)
+                            for el in els:
+                                try:
+                                    if not await el.is_visible():
+                                        continue
+
+                                    txt = (await el.text_content() or "").strip()
+
+                                    # 过滤掉按钮类文字
+                                    if any(x in txt for x in ["确定", "提交", "关闭", "取消", "下一题"]):
+                                        continue
+
+                                    box = await el.bounding_box()
+                                    if box and box["width"] > 0 and box["height"] > 0:
+                                        all_options.append(el)
+                                except:
+                                    continue
+                        except:
+                            continue
+
+                    if all_options:
+                        opt = random.choice(all_options)
+                        box = await opt.bounding_box()
+
+                        # 尽量点左侧圆圈位置
+                        x = box["x"] + 15
+                        y = box["y"] + box["height"] / 2
+
+                        await page.mouse.click(x, y)
+                        print(f"   🎯 已随机点击一个选项 ({x:.0f}, {y:.0f})")
+                        clicked = True
+
+                except Exception as e:
+                    print(f"   ⚠️ 选项点击失败: {e}")
+
+                # 3.2 兜底：找 A / B / 对 / 正确 这些文字
+                if not clicked:
+                    for target_text in ["A. ", "A.", "A", "对", "正确", "是"]:
+                        try:
+                            els = await ctx.query_selector_all(f'text="{target_text}"')
+                            for el in els:
+                                box = await el.bounding_box()
+                                if box and box["width"] > 0 and box["height"] > 0:
+                                    await page.mouse.click(
+                                        box["x"] + box["width"] / 2,
+                                        box["y"] + box["height"] / 2
+                                    )
+                                    print(f"   🎯 兜底点击答案: {target_text}")
+                                    clicked = True
+                                    break
+                        except:
+                            pass
+
+                        if clicked:
                             break
-                except: pass
-                
-                # 备用：点右上角 X 的坐标
+
+                await asyncio.sleep(1)
+
+                # 3.3 点击提交/确定
                 try:
-                    xs = await d.query_selector_all('.el-icon-close, .el-dialog__headerbtn, [class*="close"]')
+                    if await click_btn(ctx, ["提交", "确定", "完成"]):
+                        print("   ✅ 已提交答案")
+                        await asyncio.sleep(1.5)
+                except:
+                    pass
+
+                # 3.4 提交后尝试关闭
+                try:
+                    xs = await ctx.query_selector_all(
+                        '.el-icon-close, .el-dialog__headerbtn, [class*="close"]'
+                    )
                     for x_el in xs:
                         box = await x_el.bounding_box()
-                        if box and box['width'] > 0:
-                            await page.mouse.click(box['x'] + box['width']/2, box['y'] + box['height']/2)
-                            break
-                except: pass
-                
-                await asyncio.sleep(3)
+                        if box and box["width"] > 0 and box["height"] > 0:
+                            await page.mouse.click(
+                                box["x"] + box["width"] / 2,
+                                box["y"] + box["height"] / 2
+                            )
+                            print("   ✅ 已点击右上角 X")
+                            await asyncio.sleep(1)
+                            return True
+                except:
+                    pass
+
                 return True
-            # ========================================
-            
-            # ========== 2. 正常题目的处理逻辑 ==========
-            if any(kw in t for kw in ["单选题", "多选题", "判断题", "请选择", "作答"]):
-                print(f"\n📌 遇到常规题目: {t[:60]}...")
-                opts = []
-                seen = set()
-                for sel in ['label', 'li', '[class*="option"]', '.el-radio', '.el-checkbox']:
-                    for el in await d.query_selector_all(sel):
-                        try:
-                            if await el.is_visible():
-                                txt = (await el.text_content() or "").strip()
-                                if txt and len(txt) < 300 and txt not in seen:
-                                    seen.add(txt); opts.append(el)
-                        except: continue
-                
-                if not opts:
-                    if await click_btn(ctx, ["关闭", "我知道了", "不再提示", "确定"]): return True
-                    continue
 
-                for i, opt in enumerate(opts):
-                    txt = (await opt.text_content() or "").strip()[:40]
-                    print(f"   🔄 尝试选项 {i+1}: {txt}")
-                    try:
-                        await opt.evaluate("el => el.closest('label,.el-radio,.el-checkbox')?.click()||el.click()")
-                    except:
-                        try: await opt.click(force=True)
-                        except: continue
+            # ========== 4. 如果不是题目：直接关闭 ==========
+            else:
+                print("   🚪 判断为普通弹窗，直接关闭")
 
-                    await asyncio.sleep(1)
-                    await click_btn(ctx, ["确定", "提交"])
-                    await asyncio.sleep(1.5)
+                closed = False
 
-                    nd = await find_el(ctx, ['.el-message-box', '[class*="dialog"]', '.el-overlay'])
-                    if not nd:
-                        print("   ✅ 正确!"); return True
-                    
-                    nt = (await nd.inner_text() or "")
-                    if "错误" in nt or "不正确" in nt:
-                        print("   ❌ 错误, 尝试下一个选项")
-                        await click_btn(ctx, ["确定", "关闭", "我知道了"])
+                try:
+                    if await click_btn_in_popup(
+                        page,
+                        d,
+                        ["关闭", "确定", "我知道了", "不再提示", "下次再说", "取消"]
+                        ):
+                        print("   ✅ 已关闭普通弹窗")
                         await asyncio.sleep(1)
-                        continue
-                    
-                    await click_btn(ctx, ["关闭", "确定"])
+                        closed = True
+                except Exception as e:
+                    print(f"   ⚠️ 关闭普通弹窗失败: {e}")
+
+                # 兜底点 X
+                if not closed:
+                    closed = await close_popup_by_x(page, ctx, d)
+
+                # 最后兜底 ESC
+                if not closed:
+                    await page.keyboard.press("Escape")
+                    print("   ⌨️ 已按 ESC 尝试关闭普通弹窗")
+                    await asyncio.sleep(1)
                     return True
 
-            # 保底：乱七八糟的提示框统统关掉
-            if await click_btn(ctx, ["关闭", "确定", "我知道了", "不再提示"]):
+                print("   ✅ 已关闭普通弹窗")
                 return True
-                
+
         except Exception as e:
             continue
-            
+
     return False
 
+async def find_real_popup(ctx):
+    """只检测真正显示在屏幕中间的弹窗，避免误判隐藏 DOM"""
+    handle = await ctx.evaluate_handle("""
+    () => {
+        const roots = document.querySelectorAll(`
+            .el-dialog__wrapper,
+            .el-message-box__wrapper,
+            .el-dialog,
+            .el-message-box,
+            .tm_dialog,
+            [role="dialog"]
+        `);
 
+        const vw = window.innerWidth;
+        const vh = window.innerHeight;
+
+        for (const root of roots) {
+            const target =
+                root.querySelector('.el-dialog, .el-message-box, .tm_dialog, [role="dialog"]')
+                || root;
+
+            const rs = window.getComputedStyle(root);
+            const ts = window.getComputedStyle(target);
+            const r = target.getBoundingClientRect();
+
+            const visible =
+                rs.display !== 'none' &&
+                rs.visibility !== 'hidden' &&
+                ts.display !== 'none' &&
+                ts.visibility !== 'hidden' &&
+                parseFloat(ts.opacity || '1') > 0.05 &&
+                r.width > 250 &&
+                r.height > 100 &&
+                r.right > 0 &&
+                r.bottom > 0 &&
+                r.left < vw &&
+                r.top < vh;
+
+            if (!visible) continue;
+
+            const centerX = r.left + r.width / 2;
+            const centerY = r.top + r.height / 2;
+
+            const nearCenter =
+                Math.abs(centerX - vw / 2) < vw * 0.35 &&
+                Math.abs(centerY - vh / 2) < vh * 0.35;
+
+            if (!nearCenter) continue;
+
+            return target;
+        }
+
+        return null;
+    }
+    """)
+
+    el = handle.as_element()
+    return el
+
+async def click_btn_in_popup(page, popup, texts):
+    """只在当前弹窗里面找按钮，并用坐标点击"""
+
+    for text in texts:
+        selectors = [
+            f'button:has-text("{text}")',
+            f'.el-button:has-text("{text}")',
+            f'a:has-text("{text}")',
+            f'span:has-text("{text}")',
+            f'div:has-text("{text}")',
+            f'text="{text}"',
+        ]
+
+        for sel in selectors:
+            try:
+                btns = await popup.query_selector_all(sel)
+
+                for btn in btns:
+                    try:
+                        if not await btn.is_visible():
+                            continue
+
+                        box = await btn.bounding_box()
+                        if not box or box["width"] <= 0 or box["height"] <= 0:
+                            continue
+
+                        x = box["x"] + box["width"] / 2
+                        y = box["y"] + box["height"] / 2
+
+                        await page.mouse.click(x, y)
+                        print(f"   ✅ 已点击弹窗按钮: {text}")
+                        await asyncio.sleep(0.8)
+                        return True
+
+                    except:
+                        continue
+
+            except:
+                continue
+
+    return False
+
+async def close_unanswered_warning(page, ctx):
+    """关闭‘未做答的弹题不能关闭’提示框"""
+    try:
+        has_warning = await ctx.evaluate("""() => {
+            return document.body && document.body.innerText.includes("未做答的弹题不能关闭");
+        }""")
+
+        if not has_warning:
+            return False
+
+        print("   ⚠️ 检测到提示框")
+
+        # 优先点提示框右上角 X
+        selectors = [
+            ".el-message-box__headerbtn",
+            ".el-message-box__close",
+            ".el-icon-close",
+            ".el-message-box [class*='close']",
+            "text=×"
+        ]
+
+        for sel in selectors:
+            try:
+                xs = await ctx.query_selector_all(sel)
+                for x in xs:
+                    if await x.is_visible():
+                        box = await x.bounding_box()
+                        if box:
+                            await page.mouse.click(
+                                box["x"] + box["width"] / 2,
+                                box["y"] + box["height"] / 2
+                            )
+                            print("   ✅ 已关闭未答题提示框")
+                            await asyncio.sleep(0.8)
+                            return True
+            except:
+                pass
+
+    except Exception as e:
+        print(f"   ⚠️ 关闭未答题提示失败: {e}")
+        return False
+
+async def close_popup_by_x(page, ctx, popup):
+    """专门关闭只有右上角 X 的普通弹窗"""
+
+    # 先拿弹窗位置
+    pbox = await popup.bounding_box()
+    if not pbox:
+        return False
+
+    # 1. 优先找常见 X 按钮
+    x_selectors = [
+        ".el-dialog__headerbtn",
+        ".el-dialog__close",
+        ".el-icon-close",
+        "i[class*='close']",
+        "span[class*='close']",
+        "button[class*='close']",
+        "[class*='close']",
+        "text=×",
+    ]
+
+    for sel in x_selectors:
+        try:
+            xs = await ctx.query_selector_all(sel)
+
+            for x_el in xs:
+                try:
+                    if not await x_el.is_visible():
+                        continue
+
+                    box = await x_el.bounding_box()
+                    if not box or box["width"] <= 0 or box["height"] <= 0:
+                        continue
+
+                    cx = box["x"] + box["width"] / 2
+                    cy = box["y"] + box["height"] / 2
+
+                    # 只点弹窗右上区域，避免点错页面其它 X
+                    in_popup_top_right = (
+                        pbox["x"] < cx < pbox["x"] + pbox["width"] and
+                        pbox["y"] < cy < pbox["y"] + 90 and
+                        cx > pbox["x"] + pbox["width"] * 0.7
+                    )
+
+                    if not in_popup_top_right:
+                        continue
+
+                    await page.mouse.click(cx, cy)
+                    print(f"   ✅ 已点击弹窗右上角 X: {sel}")
+                    await asyncio.sleep(1)
+                    return True
+
+                except:
+                    continue
+
+        except:
+            continue
+
+    # 2. 兜底：直接按弹窗右上角坐标点
+    try:
+        x = pbox["x"] + pbox["width"] - 35
+        y = pbox["y"] + 30
+
+        await page.mouse.click(x, y)
+        print(f"   ✅ 已按坐标点击弹窗右上角 X ({x:.0f}, {y:.0f})")
+        await asyncio.sleep(1)
+        return True
+
+    except:
+        return False
+    
 async def click_next_video(page):
     """根据网页真实状态，点下一个【未播放完成】的视频章节并播放"""
     print("   🔍 正在扫描未完成的视频...")
@@ -313,7 +621,7 @@ async def click_next_video(page):
     except Exception as e:
         print(f"   ⚠️ click_next_video 报错: {e}")
         return False
-
+    
 async def main():
     browser = None
     try:
@@ -465,16 +773,22 @@ async def main():
                                 elapsed = current_time_val - last_video_change
                                 print(f"\r⏳ 视频已到底，原地等待服务器发放蓝勾... (已等 {elapsed:.0f}s) ", end="")
                                 
-                                if elapsed > 10:
-                                    print("\n⚠️ 等待超时，服务器未发蓝勾，尝试重新播放补全进度...")
+                                if elapsed > 15: # 给服务器多一点判定时间
+                                    print("\n⚠️ 等待超时，服务器未发蓝勾，尝试倒退 15 秒重新播放补全时长...")
                                     try:
-                                        await page.evaluate("() => { document.querySelectorAll('video').forEach(v => v.play()); }")
+                                        # 核心修复：视频到底后直接 play() 是无效的，必须往回拨一段进度才能继续发心跳包
+                                        await page.evaluate("""() => { 
+                                            document.querySelectorAll('video').forEach(v => { 
+                                                v.currentTime = Math.max(0, v.duration - 15); 
+                                                v.play(); 
+                                            }); 
+                                        }""")
                                     except: pass
                                     last_video_change = current_time_val
                             else:
                                 # 视频中途意外暂停（比如AI弹窗刚关掉还没来得及恢复）
                                 elapsed = current_time_val - last_video_change
-                                if elapsed > 15:
+                                if elapsed > 5:
                                     print(f"\n📴 视频中途意外暂停 (当前进度: {ct:.0f}s / {dur:.0f}s)")
                                     print("   🔧 重新播放...")
                                     await ensure_playing(page)
